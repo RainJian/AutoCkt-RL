@@ -1,0 +1,180 @@
+# -*- coding: utf-8 -*-
+"""
+Phase 5 / T5.1 图表框架：三张核心图
+  fig1_success_comparison.png  基线 vs 变体(双 seed) 成功率柱状图（带误差棒）
+  fig2_failure_scatter.png     失败 case 在 spec 空间的分布（散点，log 坐标）
+  fig3_training_curves.png     基线与变体的训练 reward 曲线
+
+数据源（缺哪个就跳过哪张，Phase 4 评测完成后自动补齐）：
+  - eval/results/<prefix>_results.csv        rollout.py 逐条评测结果
+  - ~/ray_results/train_45nm_ngspice*/<trial>/progress.csv   tune 训练日志
+
+用法（在仓库根目录）：
+  env -u PYTHONPATH "<conda>/envs/autockt/python.exe" resume_materials/make_plots.py
+"""
+import csv
+import glob
+import os
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+plt.rcParams["axes.unicode_minus"] = False
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_DIR = os.path.join(ROOT, "eval", "results")
+RAY_RESULTS = os.path.expanduser("~/ray_results")
+OUT_DIR = os.path.join(ROOT, "resume_materials", "figures")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# 计划内的评测文件命名（Phase 4 产出；当前只有基线 100 条）
+EVAL_SETS = [
+    ("baseline_ckpt152_eval1000", "基线 ckpt-152"),
+    ("v2_seedA_ckpt_eval1000", "变体 seed A"),
+    ("v2_seedB_ckpt_eval1000", "变体 seed B"),
+]
+
+DIMS = ["gain", "ibias_max", "phm", "ugbw"]
+
+
+def read_results(csv_path):
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r["goal"] = [float(x) for x in r["goal_specs"].split(";")]
+        r["final"] = [float(x) for x in r["final_specs"].split(";")]
+        r["success"] = int(r["success"])
+        r["steps"] = int(r["steps"])
+    return rows
+
+
+def fig1_success_bars():
+    """柱状图：基线 vs 变体双 seed vs 变体均值；seed 间差异画误差棒。"""
+    labels, rates, errs = [], [], []
+    seed_rates = []
+    for prefix, label in EVAL_SETS:
+        path = os.path.join(RESULTS_DIR, prefix + "_results.csv")
+        if not os.path.exists(path):
+            print("[fig1] 跳过（缺文件）: " + path)
+            continue
+        rows = read_results(path)
+        rate = sum(r["success"] for r in rows) / len(rows) * 100
+        print("[fig1] %s: %d/%d = %.1f%%" % (label, sum(r["success"] for r in rows), len(rows), rate))
+        if "seed" in prefix:
+            seed_rates.append(rate)
+            labels.append(label)
+            rates.append(rate)
+            errs.append(0.0)
+        else:
+            labels.append(label)
+            rates.append(rate)
+            errs.append(0.0)
+    if len(seed_rates) == 2:
+        mean = sum(seed_rates) / 2
+        labels.append("变体均值")
+        rates.append(mean)
+        errs.append(abs(seed_rates[0] - seed_rates[1]) / 2)  # 半幅作误差棒
+    if not rates:
+        return
+    colors = ["#888888"] + ["#4C9AFF"] * (len(rates) - 1)
+    plt.figure(figsize=(7, 4.5))
+    plt.bar(labels, rates, yerr=errs, capsize=6, color=colors,
+            edgecolor="black", linewidth=0.5)
+    for i, v in enumerate(rates):
+        plt.text(i, v + 1 + errs[i], "%.1f%%" % v, ha="center", fontsize=11)
+    plt.ylabel("成功率（%）")
+    plt.ylim(0, 115)
+    plt.title("两级运放自动尺寸设计：基线 vs ibias 加权 reward 变体\n"
+              "（1000 条 unseen specs，greedy 评测，done=True 即达标）")
+    plt.tight_layout()
+    out = os.path.join(OUT_DIR, "fig1_success_comparison.png")
+    plt.savefig(out, dpi=200)
+    plt.close()
+    print("[fig1] saved: " + out)
+
+
+def fig2_failure_scatter():
+    """spec 空间散点：展示失败 case 聚集在 ibias 极紧区域（失败画像可视化）。"""
+    path = os.path.join(RESULTS_DIR, "baseline_ckpt152_eval100_results.csv")
+    if not os.path.exists(path):
+        print("[fig2] 跳过（缺文件）: " + path)
+        return
+    rows = read_results(path)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, (xi, yi, xlabel, ylabel) in zip(axes, [
+        (1, 0, "ibias 上限目标 (A)", "gain 目标 (V/V)"),
+        (1, 3, "ibias 上限目标 (A)", "ugbw 目标 (Hz)"),
+    ]):
+        for r in rows:
+            x, y = r["goal"][xi], r["goal"][yi]
+            if r["success"]:
+                ax.scatter(x, y, c="#4C9AFF", s=22, alpha=0.6, edgecolors="none")
+            else:
+                ax.scatter(x, y, c="#E34850", s=90, marker="X",
+                           edgecolors="black", linewidths=0.6)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, which="both", alpha=0.25)
+    handles = [
+        plt.Line2D([], [], marker="o", color="w", markerfacecolor="#4C9AFF",
+                   markersize=8, label="达标 (91)"),
+        plt.Line2D([], [], marker="X", color="w", markerfacecolor="#E34850",
+                   markeredgecolor="black", markersize=11, label="失败 (9)"),
+    ]
+    axes[0].legend(handles=handles, loc="lower left")
+    axes[0].set_title("失败画像：失败 case 全部集中在 ibias 极紧区域\n"
+                      "（基线 ckpt-152，评测集前 100 条）")
+    plt.tight_layout()
+    out = os.path.join(OUT_DIR, "fig2_failure_scatter.png")
+    plt.savefig(out, dpi=200)
+    plt.close()
+    print("[fig2] saved: " + out)
+
+
+def fig3_training_curves():
+    """训练曲线：基线与变体各 trial 的 episode_reward_mean。"""
+    series = []
+    for pattern, label in [
+        (os.path.join(RAY_RESULTS, "train_45nm_ngspice", "*", "progress.csv"), "基线"),
+        (os.path.join(RAY_RESULTS, "train_45nm_ngspice_v2", "*", "progress.csv"), "变体v2"),
+    ]:
+        for p in sorted(glob.glob(pattern)):
+            iters, rewards = [], []
+            with open(p, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("episode_reward_mean"):
+                        iters.append(int(float(row["training_iteration"])))
+                        rewards.append(float(row["episode_reward_mean"]))
+            if iters:
+                trial = os.path.basename(os.path.dirname(p))[:22]
+                series.append((iters, rewards, "%s %s" % (label, trial)))
+                print("[fig3] %s: %d iters" % (p, len(iters)))
+    if not series:
+        print("[fig3] 未找到 progress.csv，跳过")
+        return
+    plt.figure(figsize=(8, 4.5))
+    for iters, rewards, label in series:
+        plt.plot(iters, rewards, label=label, linewidth=1.2, alpha=0.85)
+    plt.axhline(-0.02, color="gray", linestyle="--", linewidth=0.8, label="停止阈值 -0.02")
+    plt.xlabel("训练迭代")
+    plt.ylabel("episode_reward_mean")
+    plt.title("训练曲线：基线 vs ibias 加权变体")
+    plt.legend(fontsize=8)
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    out = os.path.join(OUT_DIR, "fig3_training_curves.png")
+    plt.savefig(out, dpi=200)
+    plt.close()
+    print("[fig3] saved: " + out)
+
+
+if __name__ == "__main__":
+    fig1_success_bars()
+    fig2_failure_scatter()
+    fig3_training_curves()
+    print("done.")

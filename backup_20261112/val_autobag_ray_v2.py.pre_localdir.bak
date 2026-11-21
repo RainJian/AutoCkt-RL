@@ -1,0 +1,77 @@
+"""
+[Phase 2 / v2 变体] reward shaping 消融实验训练脚本
+=========================================================================
+与 val_autobag_ray.py（基线训练脚本）的唯一差异：
+  1. 环境换成 TwoStageAmpV2（ngspice_vanilla_opamp_v2.py，ibias_max 惩罚 ×3）
+  2. 实验名 train_45nm_ngspice -> train_45nm_ngspice_v2
+  3. 新增两个 CLI 参数（不改默认行为）：
+       --seed N        设置 tune seed（Phase 3 双 seed 对照用；不设则与基线一致）
+       --stop_iters N  按 training_iteration 停止（T2.3 冒烟用；不设则维持基线
+                       的 episode_reward_mean=-0.02 停止条件）
+其余训练超参（train_batch_size/horizon/model/num_workers/env_config）
+与基线逐项一致，保证对照实验除 reward shaping 与 seed 外无其他变量。
+=========================================================================
+"""
+import ray
+import ray.tune as tune
+from ray.rllib.agents import ppo
+from autockt.envs.ngspice_vanilla_opamp_v2 import TwoStageAmpV2
+
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--checkpoint_dir', '-cpd', type=str)
+parser.add_argument('--seed', type=int, default=None, help='tune seed（Phase 3 双 seed 对照）')
+# [v2.2 修正] 基线脚本的停止条件 episode_reward_mean=-0.02 对 v2 shaped reward 失效：
+# v2 中多数 episode 快速 done(+10)，均值 1-2 个 iter 就越过 -0.02（实测 iter1 即触发停止）。
+# 改为固定迭代预算 152，与基线预算对齐（计划书 T3.1），保证消融对照的严格性。
+parser.add_argument('--stop_iters', type=int, default=152, help='按 iteration 停止（默认 152，与基线预算对齐）')
+args = parser.parse_args()
+ray.init(num_gpus=0)
+
+#configures training of the agent with associated hyperparameters
+#See Ray documentation for details on each parameter
+config_train = {
+            #"sample_batch_size": 200,
+            "train_batch_size": 1200,
+            #"sgd_minibatch_size": 1200,
+            #"num_sgd_iter": 3,
+            #"lr":1e-3,
+            #"vf_loss_coeff": 0.5,
+            "horizon":  30,
+            "num_gpus": 0,
+            "model":{"fcnet_hiddens": [64, 64]},
+            "num_workers": 4,
+            "env_config":{"generalize":True, "run_valid":False},
+            "ignore_worker_failures": True,   # 忽略单个 Worker 崩溃，尝试继续训练
+            "recreate_failed_workers": True, # 如果 Worker 崩溃，自动重新创建一个
+            }
+if args.seed is not None:
+    config_train["seed"] = args.seed
+
+stop_cond = {"training_iteration": args.stop_iters}
+
+#Runs training and saves the result in ~/ray_results/train_ngspice_45nm
+#If checkpoint fails for any reason, training can be restored
+#在循环里不断调用底层的 train() 函数（这个函数里包含了随机探索/噪声逻辑）。
+#只要是用 tune 跑起来的，默认就是开启 Exploration（探索/噪声）的。
+#PPO 算法在训练迭代过程中，内部机制会自动在动作输出上叠加随机概率分布，以实现探索，这也是为什么训练初期分数低的原因。”
+if not args.checkpoint_dir:
+    trials = tune.run_experiments({
+        "train_45nm_ngspice_v2": {
+        "checkpoint_freq":1,
+        "run": "PPO",
+        "env": TwoStageAmpV2,
+        "stop": stop_cond,
+        "config": config_train},
+    })
+else:
+    print("RESTORING NOW!!!!!!")
+    tune.run_experiments({
+        "restore_ppo": {
+        "run": "PPO",
+        "config": config_train,
+        "env": TwoStageAmpV2,
+        #"restore": trials[0]._checkpoint.value},
+        "restore": args.checkpoint_dir,
+        "checkpoint_freq":1},
+    })

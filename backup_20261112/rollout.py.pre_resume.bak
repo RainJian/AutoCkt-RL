@@ -1,0 +1,234 @@
+#!/usr/bin/env python
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import pickle
+import time
+import csv
+import numpy as np
+
+# [修改1] 强制禁用 GPU，解决 Windows 下找不到 nvidia-smi 的 WinError 2 报错
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+import gym
+import ray
+from ray.rllib.agents.ppo import PPOTrainer
+from ray.tune.registry import register_env
+
+# [修改2] 兼容不同的导入路径，防止报错 ModuleNotFoundError
+try:
+    from autockt.envs.ngspice_vanilla_opamp import TwoStageAmp
+except ImportError:
+    try:
+        from envs.ngspice_vanilla_opamp import TwoStageAmp
+    except ImportError:
+        # 最后的尝试：尝试从当前目录导入
+        import sys
+
+        sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+        from autockt.envs.ngspice_vanilla_opamp import TwoStageAmp
+
+# [Phase 2 新增] v2 变体环境（reward shaping 消融：ibias_max 惩罚 ×3）——供 Phase 4 变体评测用
+try:
+    from autockt.envs.ngspice_vanilla_opamp_v2 import TwoStageAmpV2
+    _HAS_V2 = True
+except ImportError:
+    _HAS_V2 = False
+
+
+# [修改3] 注册环境函数
+# 关键：我们需要把环境名字注册为 "two_stage_opamp"，这要和你训练时的名字一致
+def env_creator(env_config):
+    # 提供默认配置以防万一
+    config = env_config or {"generalize": True, "valid": True}
+    return TwoStageAmp(config)
+
+
+register_env("two_stage_opamp", env_creator)
+register_env("opamp-v0", env_creator)  # 保留这个以防万一
+
+# [Phase 2 新增] 注册 v2 变体环境：--env two_stage_opamp_v2 时使用（Phase 4 变体评测）
+if _HAS_V2:
+    def env_creator_v2(env_config):
+        config = env_config or {"generalize": True, "valid": True}
+        return TwoStageAmpV2(config)
+
+    register_env("two_stage_opamp_v2", env_creator_v2)
+
+
+def create_parser(parser_creator=None):
+    parser_creator = parser_creator or argparse.ArgumentParser
+    parser = parser_creator(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Roll out a reinforcement learning agent given a checkpoint.")
+
+    parser.add_argument("checkpoint", type=str, help="Checkpoint from which to roll out.")
+    parser.add_argument("--run", type=str, default="PPO", help="The algorithm or model to train.")
+    parser.add_argument("--env", type=str, default="two_stage_opamp", help="The gym environment to use.")
+    parser.add_argument("--no-render", default=True, action="store_const", const=True, help="Surpress rendering.")
+    parser.add_argument("--steps", default=10, type=int, help="Number of rollouts.")
+    parser.add_argument("--out", default=None, help="Output filename.")
+    parser.add_argument("--config", default="{}", type=json.loads, help="Algorithm-specific configuration.")
+    parser.add_argument("--num_val_specs", type=int, default=10, help="Number of untrained objectives to test on")
+    parser.add_argument("--traj_len", type=int, default=60, help="Length of each trajectory")
+    # [Phase0 新增] 评测集文件路径（不传则环境回退到训练集，仅为兼容旧行为；评测时必须显式传入）
+    parser.add_argument("--specs_file", type=str, default=None, help="Pickle file of the eval spec set (e.g. autockt/gen_specs/ngspice_specs_gen_two_stage_opamp_eval)")
+    # [Phase0 新增] 输出前缀，防止不同 checkpoint 的评测结果互相覆盖
+    parser.add_argument("--out_prefix", type=str, default=None, help="Prefix for output files under eval/results/ (default: checkpoint dir name)")
+    return parser
+
+
+def run(args, parser):
+    config = args.config
+    if not config:
+        # Load configuration from file
+        config_dir = os.path.dirname(args.checkpoint)
+        config_path = os.path.join(config_dir, "params.json")
+        if not os.path.exists(config_path):
+            config_path = os.path.join(config_dir, "../params.json")
+        if not os.path.exists(config_path):
+            # 如果找不到配置文件，手动给一个默认的
+            print("Warning: params.json not found. Using default config.")
+            config = {
+                "env": args.env,
+                "model": {"fcnet_hiddens": [256, 256]},
+                "framework": "tf"
+            }
+        else:
+            with open(config_path) as f:
+                config = json.load(f)
+
+    # [修改4] 强制覆盖配置，防止 Ray 报错
+    config["num_workers"] = 1
+    config["num_gpus"] = 0
+
+    # 强制设置环境名称
+    if not args.env:
+        args.env = config.get("env", "two_stage_opamp")
+
+    # [修改5] 初始化 Ray，显式禁用 GPU
+    if ray.is_initialized():
+        ray.shutdown()
+    ray.init(num_gpus=0, include_dashboard=False, ignore_reinit_error=True)
+
+    cls = PPOTrainer
+    print(f"Loading agent {args.run} from {args.checkpoint}...")
+    agent = cls(env=args.env, config=config)
+    agent.restore(args.checkpoint)
+
+    # 开始测试
+    rollout(agent, args.env, args.steps, args.out, args.no_render, args)
+
+
+def unlookup(norm_spec, goal_spec):
+    # 防止除零错误
+    with np.errstate(divide='ignore', invalid='ignore'):
+        spec = -1 * np.multiply((norm_spec + 1), goal_spec) / (norm_spec - 1)
+    return spec
+
+
+def rollout(agent, env_name, num_steps, out, no_render, args):
+    # [Phase0 新增] 输出目录与命名：所有结果统一进 eval/results/，带前缀防止覆盖
+    out_prefix = args.out_prefix or os.path.basename(os.path.dirname(os.path.abspath(args.checkpoint)))
+    results_dir = os.path.join("eval", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    csv_path = os.path.join(results_dir, out_prefix + "_results.csv")
+
+    if args.specs_file is None:
+        print("WARNING: --specs_file 未传入，环境将加载默认(训练)spec集。评测实验请务必显式传入评测集！")
+    else:
+        print(f"评测集: {args.specs_file}")
+
+    # [修改6] 环境初始化逻辑优化
+    env_config = {"generalize": True, "num_valid": args.num_val_specs, "save_specs": False, "run_valid": True}
+    if args.specs_file:
+        env_config["specs_path"] = args.specs_file
+
+    # 统一使用我们的创建函数
+    env = env_creator(env_config)
+
+    # get unnormlaized specs
+    norm_spec_ref = env.global_g
+    spec_num = len(env.specs)
+
+    rollouts = []
+    obs_reached = []
+    obs_nreached = []
+    reached_spec = 0
+
+    print(f"\n开始测试 {args.num_val_specs} 个案例...")
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["case_id", "goal_specs", "final_specs", "steps", "reward_total", "success", "elapsed_sec", "reached_at_step"])
+    wall_t0 = time.time()
+
+    for i in range(args.num_val_specs):
+        case_t0 = time.time()
+        print(f"\n=== Test Case {i + 1} ===")
+        state = env.reset()
+
+        # 打印当前目标
+        print(f"Goal Specs: {env.specs_ideal}")
+
+        done = False
+        reward_total = 0.0
+        steps = 0
+        reached_at_step = None
+
+        while not done and steps < args.traj_len:
+            action = agent.compute_action(state, explore=False)  # [Phase0 修正] explore=False 取分布的 mode 动作，保证评测确定性、可复现
+            next_state, reward, done, _ = env.step(action)
+            reward_total += reward
+            steps += 1
+            state = next_state
+            if done and reached_at_step is None:
+                reached_at_step = steps
+
+        # 计算最终结果
+        norm_ideal_spec = state[spec_num:spec_num + spec_num]
+        ideal_spec = unlookup(norm_ideal_spec, norm_spec_ref)
+
+        success = reached_at_step is not None  # 论文口径：episode 内任一时刻 reward>=10（done=True）即达标；不能用 reward_total>=9，会误杀先扣分后达标的 near-miss
+        if success:
+            reached_spec += 1
+            obs_reached.append(ideal_spec)
+            print("✅ Result: SUCCESS")
+            print(f"Achieved Specs: {env.cur_specs}")
+        else:
+            obs_nreached.append(ideal_spec)
+            print("❌ Result: FAILED")
+
+        elapsed = time.time() - case_t0
+        print(f"Steps: {steps}, Total Reward: {reward_total:.2f}, Elapsed: {elapsed:.1f}s")
+        # [Phase0 新增] 每条 case 落盘一行，供后续汇总与失败归因分析
+        csv_writer.writerow([i + 1, ";".join("%.6g" % x for x in np.atleast_1d(env.specs_ideal)),
+                             ";".join("%.6g" % x for x in np.atleast_1d(env.cur_specs)),
+                             steps, round(float(reward_total), 4), int(success), round(elapsed, 2),
+                             reached_at_step if reached_at_step is not None else ""])
+        csv_file.flush()
+
+    # 打印最终统计
+    total_elapsed = time.time() - wall_t0
+    print("-" * 30)
+    print(f"Final Report: {reached_spec}/{args.num_val_specs} specs reached.")
+    print(f"Total wall time: {total_elapsed:.1f}s | mean per case: {total_elapsed/args.num_val_specs:.1f}s")
+    print(f"CSV saved to: {csv_path}")
+    print("-" * 30)
+    csv_file.close()
+
+    # 保存结果文件
+    if obs_reached:
+        pickle.dump(obs_reached, open(os.path.join(results_dir, out_prefix + "_reached.pkl"), "wb"))
+    if obs_nreached:
+        pickle.dump(obs_nreached, open(os.path.join(results_dir, out_prefix + "_nreached.pkl"), "wb"))
+
+
+if __name__ == "__main__":
+    parser = create_parser()
+    args = parser.parse_args()
+    run(args, parser)

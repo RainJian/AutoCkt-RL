@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 仿真缓存（海量临时文件，禁止入库）
+temp_sim_data/
+autockt/temp_sim_data/
+
+# 运行产物
+*.out
+*.partial*.csv
+opamp_obs_*.pkl
+
+# 大体积个人汇报材料（本地保留，不入库）
+
+# 工作区/工具私有数据
+.workbuddy/
+.vscode/
+.idea/
+
+# 杂项
+google*.html
+.DS_Store
+Thumbs.db
+
+复现结果/

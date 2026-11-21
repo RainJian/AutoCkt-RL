@@ -1,0 +1,311 @@
+"""
+A new ckt environment based on a new structure of MDP
+
+[Phase 2 / v2 变体] reward shaping 消融实验——加权 reward
+=========================================================================
+基线失败画像（eval/results/baseline_ckpt152_eval100_results.csv，ckpt-152，
+评测集前 100 条，greedy，同评测协议）：9/9 失败 case 均失守 ibias_max
+（平均归一化缺口 -0.70），其中 8/9 连带失守 gain（-0.95）。根因：失败 case 的
+ibias 目标极紧（<=7e-4，典型目标 ~5e-3），agent 学到的"满配大管"策略
+（gain 700+/ugbw 8e7+，ibias ~8.4e-4）在该区域必然超电流预算。
+
+健壮性补丁（[v2.1]，仅 v2，v1 冻结不动）：
+  不稳定电路（phm<0）使 lookup() 归一化值 >1（如 phm=-175,g=60 -> 2.04），
+  超出 observation_space 上界，RLlib check_shape 抛 ValueError 杀掉 rollout
+  worker；随机策略早期频繁踩雷，反复崩溃触发 "Failed to recover from worker
+  crash"（冒烟实测 2026-11-13，28min 未跑完 iter 1）。修复：reset()/step()
+  返回前将观测 clip 到空间边界。这不影响达标判定，也不影响 [-1,1] 内的正常
+  观测（病态态只被压到边界，信号方向保留）。
+改动（仅 reward() 一处 shaping）：
+  对 ibias_max 维度的未达标惩罚乘以权重 w=3.0，其余维度权重 1.0。
+  达标容差判定（raw >= -0.02 -> return 10，触发 done）与 v1 完全一致，
+  保证成功率口径与基线可比。
+其余代码与 ngspice_vanilla_opamp.py（v1）完全相同。
+=========================================================================
+"""
+import gym
+from gym import spaces
+
+import numpy as np
+import random
+import psutil
+
+from multiprocessing.dummy import Pool as ThreadPool
+from collections import OrderedDict
+import yaml
+import yaml.constructor
+import statistics
+import os
+import IPython
+import itertools
+from eval_engines.util.core import *
+import pickle
+import os
+
+from eval_engines.ngspice.TwoStageClass import *
+
+#way of ordering the way a yaml file is read
+class OrderedDictYAMLLoader(yaml.Loader):
+    """
+    A YAML loader that loads mappings into ordered dictionaries.
+    """
+
+    def __init__(self, *args, **kwargs):
+        yaml.Loader.__init__(self, *args, **kwargs)
+
+        self.add_constructor(u'tag:yaml.org,2002:map', type(self).construct_yaml_map)
+        self.add_constructor(u'tag:yaml.org,2002:omap', type(self).construct_yaml_map)
+
+    def construct_yaml_map(self, node):
+        data = OrderedDict()
+        yield data
+        value = self.construct_mapping(node)
+        data.update(value)
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            self.flatten_mapping(node)
+        else:
+            raise yaml.constructor.ConstructorError(None, None,
+                                                    'expected a mapping node, but found %s' % node.id, node.start_mark)
+
+        mapping = OrderedDict()
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            value = self.construct_object(value_node, deep=deep)
+            mapping[key] = value
+        return mapping
+
+class TwoStageAmpV2(gym.Env):
+    metadata = {'render.modes': ['human']}
+
+    PERF_LOW = -1
+    PERF_HIGH = 0
+
+    # [v2] ibias_max 维度惩罚权重（失败画像：9/9 失败均失守 ibias_max）
+    IBIAS_WEIGHT = 3.0
+
+    #obtains yaml file
+    path = "D:/AutoCkt-master"
+    CIR_YAML = "D:/AutoCkt-master/eval_engines/ngspice/ngspice_inputs/yaml_files/two_stage_opamp.yaml"
+
+    def __init__(self, env_config):
+        self.multi_goal = env_config.get("multi_goal",False)
+        self.generalize = env_config.get("generalize",False)
+        num_valid = env_config.get("num_valid",50)
+        self.specs_save = env_config.get("save_specs", False)
+        self.valid = env_config.get("run_valid", False)
+
+        self.env_steps = 0
+        with open(TwoStageAmpV2.CIR_YAML, 'r') as f:
+            yaml_data = yaml.load(f, OrderedDictYAMLLoader)
+
+        # design specs
+        if self.generalize == False:
+            specs = yaml_data['target_specs']
+        else:
+            # [Phase0 改造] 支持通过 env_config["specs_path"] 指定评测集；默认仍为训练集，保证训练行为不变
+            load_specs_path = env_config.get("specs_path", "D:/AutoCkt-master/autockt/gen_specs/ngspice_specs_gen_two_stage_opamp")
+            with open(load_specs_path, 'rb') as f:
+                specs = pickle.load(f)
+
+        self.specs = OrderedDict(sorted(specs.items(), key=lambda k: k[0]))
+        if self.specs_save:
+            with open("specs_"+str(num_valid)+str(random.randint(1,100000)), 'wb') as f:
+                pickle.dump(self.specs, f)
+
+        self.specs_ideal = []
+        self.specs_id = list(self.specs.keys())
+        self.fixed_goal_idx = -1
+        self.num_os = len(list(self.specs.values())[0])
+
+        # param array
+        params = yaml_data['params']
+        self.params = []
+        self.params_id = list(params.keys())
+
+        for value in params.values():
+            param_vec = np.arange(value[0], value[1], value[2])
+            self.params.append(param_vec)
+
+        #initialize sim environment
+        self.sim_env = TwoStageClass(yaml_path=TwoStageAmpV2.CIR_YAML, num_process=1, path=TwoStageAmpV2.path)
+        #定义动作含义
+        # -1: 参数索引减 1
+        #  0: 参数保持不变
+        #  2: 参数索引加 2
+        self.action_meaning = [-1,0,2]
+        self.action_space = spaces.Tuple([spaces.Discrete(len(self.action_meaning))]*len(self.params_id))
+        #self.action_space = spaces.Discrete(len(self.action_meaning)**len(self.params_id))
+        # 修正后的定义
+        # 前 2*len(self.specs_id) 位是归一化后的 spec 差异，范围 [-1, 1] 比较保险
+        # 后 len(self.params_id) 位是参数索引，范围应该从 0 到 各个参数的最大步数
+        obs_low = np.array([TwoStageAmpV2.PERF_LOW] * 2 * len(self.specs_id) + [0] * len(self.params_id))
+
+        # 这里的 100 是一个安全上限，或者你可以根据 self.params 的实际长度来设定
+        obs_high = np.array([1.0] * 2 * len(self.specs_id) + [100.0] * len(self.params_id))
+
+        self.observation_space = spaces.Box(
+            low=obs_low.astype(np.float32),
+            high=obs_high.astype(np.float32),
+            dtype=np.float32
+        )
+
+        #initialize current param/spec observations
+        self.cur_specs = np.zeros(len(self.specs_id), dtype=np.float32)
+        self.cur_params_idx = np.zeros(len(self.params_id), dtype=np.int32)
+
+        #Get the g* (overall design spec) you want to reach
+        self.global_g = []
+        for spec in list(self.specs.values()):
+                self.global_g.append(float(spec[self.fixed_goal_idx]))
+        self.g_star = np.array(self.global_g)
+        self.global_g = np.array(yaml_data['normalize'])
+
+        #objective number (used for validation)
+        self.obj_idx = 0
+
+    def reset(self):
+        #if multi-goal is selected, every time reset occurs, it will select a different design spec as objective
+        if self.generalize == True:
+            if self.valid == True:
+                if self.obj_idx > self.num_os-1:
+                    self.obj_idx = 0
+                idx = self.obj_idx
+                self.obj_idx += 1
+            else:
+                idx = random.randint(0,self.num_os-1)
+            self.specs_ideal = []
+            for spec in list(self.specs.values()):
+                self.specs_ideal.append(spec[idx])
+            self.specs_ideal = np.array(self.specs_ideal)
+        else:
+            if self.multi_goal == False:
+                self.specs_ideal = self.g_star
+            else:
+                idx = random.randint(0,self.num_os-1)
+                self.specs_ideal = []
+                for spec in list(self.specs.values()):
+                    self.specs_ideal.append(spec[idx])
+                self.specs_ideal = np.array(self.specs_ideal)
+        #print("num total:"+str(self.num_os))
+
+        #applicable only when you have multiple goals, normalizes everything to some global_g
+        self.specs_ideal_norm = self.lookup(self.specs_ideal, self.global_g)
+
+        #initialize current parameters
+        #self.cur_params_idx = np.array([33, 33, 33, 33, 33, 14, 20])
+        self.cur_params_idx = np.array([5, 5, 5, 5, 5, 5, 5])
+        self.cur_specs = self.update(self.cur_params_idx)
+        cur_spec_norm = self.lookup(self.cur_specs, self.global_g)
+        reward = self.reward(self.cur_specs, self.specs_ideal)
+
+        #observation is a combination of current specs distance from ideal, ideal spec, and current param vals
+        self.ob = np.concatenate([cur_spec_norm, self.specs_ideal_norm, self.cur_params_idx])
+        # [v2.1] 观测越界保护：phm<0 等病态态会使归一化值超出 Box 边界，触发 RLlib
+        # check_shape 崩溃；clip 到边界，保留"极差"信号方向，不影响正常观测与达标判定
+        self.ob = np.clip(self.ob, self.observation_space.low, self.observation_space.high)
+        return np.array(self.ob, dtype=np.float32)
+
+    def step(self, action):
+        """
+        :param action: is vector with elements between 0 and 1 mapped to the index of the corresponding parameter
+        :return:
+        """
+
+        #根据动作更新参数索引
+        action = list(np.reshape(np.array(action),(np.array(action).shape[0],)))
+        #原有参数索引 + 动作带来的变化
+        self.cur_params_idx = self.cur_params_idx + np.array([self.action_meaning[a] for a in action])
+
+#        self.cur_params_idx = self.cur_params_idx + np.array(self.action_arr[int(action)])
+        self.cur_params_idx = np.clip(self.cur_params_idx, [0]*len(self.params_id), [(len(param_vec)-1) for param_vec in self.params])
+        #Get current specs and normalize
+        self.cur_specs = self.update(self.cur_params_idx)
+        cur_spec_norm  = self.lookup(self.cur_specs, self.global_g)
+        # 计算当前的奖励
+        reward = self.reward(self.cur_specs, self.specs_ideal)
+        done = False# 默认为 False，意味着继续跑
+
+        #incentivize reaching goal state
+        if (reward >= 10):
+            done = True
+            print('-'*10)
+            print('params = ', self.cur_params_idx)
+            print('specs:', self.cur_specs)
+            print('ideal specs:', self.specs_ideal)
+            print('re:', reward)
+            print('-'*10)
+
+        self.ob = np.concatenate([cur_spec_norm, self.specs_ideal_norm, self.cur_params_idx])
+        # [v2.1] 观测越界保护（同 reset()）
+        self.ob = np.clip(self.ob, self.observation_space.low, self.observation_space.high)
+        self.env_steps = self.env_steps + 1
+
+        #print('cur ob:' + str(self.cur_specs))
+        #print('ideal spec:' + str(self.specs_ideal))
+        #print(reward)
+        return np.array(self.ob, dtype=np.float32), reward, done, {}
+
+    # 1. 计算相对误差 (对应公式中的分数部分)
+    def lookup(self, spec, goal_spec):
+        goal_spec = [float(e) for e in goal_spec]
+        norm_spec = (spec-goal_spec)/(goal_spec+spec)# 这里的公式结构就是 (o - o*) / (o + o*)
+        return norm_spec
+
+    # 2. 截断逻辑 (对应公式中的 min(..., 0))  +  [v2] ibias_max 加权 shaping
+    def reward(self, spec, goal_spec):
+        '''
+        Reward: doesn't penalize for overshooting spec, is negative
+
+        [v2] shaping 改动：ibias_max 维度未达标惩罚 × IBIAS_WEIGHT(=3.0)。
+        达标容差判定使用未加权的 raw 和（raw >= -0.02 -> 10），与 v1 完全一致，
+        因此"任一时刻 reward>=10 触发 done"的达标口径不变，成功率与基线可比。
+        '''
+        rel_specs = self.lookup(spec, goal_spec)
+        raw = 0.0     # 未加权惩罚和：仅用于达标容差判定（与 v1 相同）
+        shaped = 0.0  # 加权惩罚和：训练信号（shaping）
+        for i,rel_spec in enumerate(rel_specs):
+            if(self.specs_id[i] == 'ibias_max'):
+                rel_spec = rel_spec*-1.0#/10.0
+            if rel_spec < 0:#只有小于0（未达标）才计入惩罚
+                raw += rel_spec
+                if self.specs_id[i] == 'ibias_max':
+                    shaped += self.IBIAS_WEIGHT * rel_spec
+                else:
+                    shaped += rel_spec
+            # 达标(>=0)的维度被截断，两个和都不加
+
+        # 达标判定逻辑与 v1 逐位一致：raw >= -0.02 即视为全部达标。
+        # 因权重均 >= 1，shaped <= raw，故 raw < -0.02 时必有 shaped < -0.02（负值）。
+        if raw >= -0.02:
+            return 10
+        return shaped
+
+    def update(self, params_idx):
+        """
+
+        :param action: an int between 0 ... n-1
+        :return:
+        """
+        #impose constraint tail1 = in
+        #params_idx[0] = params_idx[3]
+        params = [self.params[i][params_idx[i]] for i in range(len(self.params_id))]
+        param_val = [OrderedDict(list(zip(self.params_id,params)))]
+
+        #run param vals and simulate
+        cur_specs = OrderedDict(sorted(self.sim_env.create_design_and_simulate(param_val[0])[1].items(), key=lambda k:k[0]))
+        cur_specs = np.array(list(cur_specs.values()))
+
+        return cur_specs
+
+def main():
+  env_config = {"generalize":True, "valid":True}
+  env = TwoStageAmpV2(env_config)
+  env.reset()
+  env.step([2,2,2,2,2,2,2])
+
+  IPython.embed()
+
+if __name__ == "__main__":
+  main()
